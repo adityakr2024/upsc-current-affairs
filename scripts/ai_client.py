@@ -4,7 +4,7 @@ ai_client.py — Multi-provider AI client with smart rotation, fallback & metric
 Providers (5 total, used in round-robin):
   • Groq 1      — llama-3.1-8b-instant    (14,400 req/day free)
   • Gemini 1    — gemini-2.0-flash-lite   (1,500 req/day free)
-  • Groq 2      — gemma2-9b-it            (14,400 req/day free, 2nd key)
+  • Groq 2      — llama3-8b-8192           (14,400 req/day free, 2nd key)
   • Gemini 2    — gemini-2.0-flash-lite   (1,500 req/day free, 2nd key)
   • Gemini 3    — gemini-1.5-flash        (1,500 req/day free, 3rd key)
   • OpenRouter  — llama-3.2-3b:free       (50 req/day — emergency only)
@@ -152,7 +152,7 @@ PROVIDERS: list[Provider] = [
         name="groq_2", priority=2,
         base_url="https://api.groq.com/openai/v1",
         key_env="GROQ_API_KEY_2",
-        model="llama-3.3-70b-versatil",          # gemma2-9b-it decommissioned → replaced
+        model="llama-3.3-70b-versatile",          # gemma2-9b-it decommissioned → replaced
         rpm=20, rpd=14400,
     ),
     Provider(
@@ -266,6 +266,7 @@ class ProviderPool:
             except Exception as exc:
                 last_err = exc
                 e = str(exc)
+                print(f"    🔍 {p.name} raw error: {e[:200]}")  # DEBUG
 
                 # ── Classify error ────────────────────────────────────────────
                 is_rate   = ("429" in e or "quota" in e.lower()
