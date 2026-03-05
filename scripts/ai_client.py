@@ -126,10 +126,10 @@ class Provider:
         get_metrics().record_call(self.name, p_tok, c_tok, latency)
         return content.strip(), p_tok, c_tok
 
-    def mark_cooldown(self) -> None:
-        self._cooldown_until = time.time() + COOLDOWN
+    def mark_cooldown(self, duration: float = COOLDOWN) -> None:
+        self._cooldown_until = time.time() + duration
         get_metrics().record_error(self.name)
-        print(f"    ⏸  {self.name}: rate-limited — cooling {COOLDOWN}s")
+        print(f"    ⏸  {self.name}: rate-limited — cooling {duration:.0f}s")
 
     def mark_dead(self, reason: str = "") -> None:
         self._dead = True
@@ -149,35 +149,35 @@ PROVIDERS: list[Provider] = [
         rpm=20, rpd=14400,
     ),
     Provider(
-        name="gemini_1", priority=2,
+        name="groq_2", priority=2,
+        base_url="https://api.groq.com/openai/v1",
+        key_env="GROQ_API_KEY_2",
+        model="llama3-8b-8192",          # gemma2-9b-it decommissioned → replaced
+        rpm=20, rpd=14400,
+    ),
+    Provider(
+        name="gemini_1", priority=3,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         key_env="GEMINI_API_KEY_1",
         model="gemini-2.0-flash-lite",
-        rpm=12, rpd=1500,
-    ),
-    Provider(
-        name="groq_2", priority=3,
-        base_url="https://api.groq.com/openai/v1",
-        key_env="GROQ_API_KEY_2",
-        model="gemma2-9b-it",
-        rpm=20, rpd=14400,
+        rpm=5, rpd=1500,                  # conservative — free tier bursts aggressively
     ),
     Provider(
         name="gemini_2", priority=4,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         key_env="GEMINI_API_KEY_2",
         model="gemini-2.0-flash-lite",
-        rpm=12, rpd=1500,
+        rpm=5, rpd=1500,
     ),
     Provider(
         name="gemini_3", priority=5,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         key_env="GEMINI_API_KEY_3",
         model="gemini-1.5-flash",
-        rpm=12, rpd=1500,
+        rpm=5, rpd=1500,
     ),
     Provider(
-        name="openrouter", priority=6,    # last resort
+        name="openrouter", priority=6,
         base_url="https://openrouter.ai/api/v1",
         key_env="OPENROUTER_API_KEY",
         model="meta-llama/llama-3.2-3b-instruct:free",
@@ -266,14 +266,40 @@ class ProviderPool:
             except Exception as exc:
                 last_err = exc
                 e = str(exc)
-                if "429" in e or "rate" in e.lower() or "quota" in e.lower() or "limit" in e.lower():
-                    p.mark_cooldown()
-                elif "404" in e or "No endpoints" in e or "not found" in e.lower():
-                    p.mark_dead("model not found")
-                elif "401" in e or "403" in e or "api key" in e.lower():
+
+                # ── Classify error ────────────────────────────────────────────
+                is_rate   = ("429" in e or "quota" in e.lower()
+                             or "resource_exhausted" in e.lower()
+                             or "too many requests" in e.lower())
+                is_dead   = ("404" in e or "No endpoints" in e
+                             or "not found" in e.lower()
+                             or "decommissioned" in e.lower()
+                             or "deprecated" in e.lower())
+                is_auth   = ("401" in e or "403" in e
+                             or ("api key" in e.lower() and "invalid" in e.lower()))
+                is_pay    = "402" in e
+                # 400 with model error → dead; 400 generic → cooldown
+                is_bad_model = ("400" in e and (
+                    "decommissioned" in e.lower() or "not supported" in e.lower()
+                    or "invalid model" in e.lower() or "model_not_found" in e.lower()
+                ))
+
+                if is_dead or is_bad_model:
+                    p.mark_dead("model not available")
+                elif is_auth:
                     p.mark_dead(f"auth error — check secret {p.key_env}")
-                elif "402" in e:
-                    p.mark_dead("payment required / spend limit")
+                elif is_pay:
+                    p.mark_dead("spend limit reached")
+                elif is_rate:
+                    # If a Gemini provider hits 429, cool ALL Gemini providers
+                    # (they share project quota on free tier)
+                    if "gemini" in p.name:
+                        for other in self._providers:
+                            if "gemini" in other.name and other.name != p.name:
+                                other.mark_cooldown(duration=120)
+                        p.mark_cooldown(duration=120)
+                    else:
+                        p.mark_cooldown()
                 else:
                     print(f"    ⚠  {p.name}: {exc}")
                     p.mark_cooldown()
