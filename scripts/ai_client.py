@@ -152,7 +152,7 @@ PROVIDERS: list[Provider] = [
         name="groq_2", priority=2,
         base_url="https://api.groq.com/openai/v1",
         key_env="GROQ_API_KEY_2",
-        model="llama3-8b-8192",          # gemma2-9b-it decommissioned → replaced
+        model="llama-3.3-70b-versatil",          # gemma2-9b-it decommissioned → replaced
         rpm=20, rpd=14400,
     ),
     Provider(
