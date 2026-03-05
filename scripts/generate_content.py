@@ -19,8 +19,9 @@ import time
 
 from ai_client import chat
 
-# Sleep between articles to respect free-tier rate limits (8 req/min = 7.5s min)
-INTER_ARTICLE_SLEEP = 6   # seconds
+# Sleep between articles — must be >= slowest provider's min_interval
+# Groq: 60/20 = 3s, Gemini: 60/5 = 12s → use 13s to be safe
+INTER_ARTICLE_SLEEP = 13  # seconds
 
 BATCH_SYSTEM = """You are a UPSC expert coach and Hindi translator.
 Given a news headline, source, and summary — return a single JSON object with ALL these fields:
