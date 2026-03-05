@@ -1,148 +1,168 @@
 """
 generate_content.py — AI enrichment pipeline.
 
-For each filtered article:
-  1. Generate 2–3 sentence context (why it matters for UPSC)
-  2. Extract 3–5 key points
-  3. Fact-check credibility assessment
-  4. Translate headline + context to Hindi
+OPTIMISED: Single AI call per article returns ALL fields at once:
+  - context (why it matters for UPSC)
+  - key_points (3-5 exam-relevant bullets)
+  - fact_check (credibility assessment)
+  - title_hi + context_hi + key_points_hi (Hindi translations)
 
-All AI calls go through ai_client.py (OpenRouter free models).
+This reduces API calls from 4×N to 1×N, staying well within free-tier limits.
+Rate limit: 5s sleep between articles to respect 8 req/min free-tier cap.
 """
 
+from __future__ import annotations
+
 import json
-import time
 import re
+import time
+
 from ai_client import chat
 
+# Sleep between articles to respect free-tier rate limits (8 req/min = 7.5s min)
+INTER_ARTICLE_SLEEP = 6   # seconds
 
-# ─── Prompt templates ────────────────────────────────────────────────────────
+BATCH_SYSTEM = """You are a UPSC expert coach and Hindi translator.
+Given a news headline, source, and summary — return a single JSON object with ALL these fields:
 
-CONTEXT_SYSTEM = """You are a UPSC expert coach. Given a news headline and summary,
-write a concise 2-3 sentence context explaining:
-1. What happened (brief)
-2. Why it matters for UPSC exam preparation
-3. Which GS paper / topic it relates to
+{
+  "context": "2-3 sentences: what happened and why it matters for UPSC exam preparation. Mention which GS paper it relates to.",
+  "key_points": ["Point 1.", "Point 2.", "Point 3.", "Point 4."],
+  "fact_check": {
+    "status": "verified|likely_accurate|unverified|suspicious",
+    "confidence": 0.0,
+    "notes": "One sentence explanation."
+  },
+  "title_hi": "Hindi translation of headline in Devanagari script",
+  "context_hi": "Hindi translation of the context field in Devanagari script",
+  "key_points_hi": ["Hindi point 1.", "Hindi point 2.", "Hindi point 3."]
+}
 
-Be factual. No markdown. Plain text only."""
-
-KEY_POINTS_SYSTEM = """You are a UPSC expert. Extract exactly 3-5 bullet points
-from this news article that are most exam-relevant. Each point: one sentence, crisp.
-Return ONLY a JSON array of strings. No extra text. Example:
-["Point 1.", "Point 2.", "Point 3."]"""
-
-FACT_CHECK_SYSTEM = """You are a fact-checker for Indian news. Assess the credibility
-of this article snippet. Consider: Is the source reliable? Are the claims specific
-and verifiable? Are there any red flags?
-Return a JSON object with exactly these keys:
-{"status": "verified|likely_accurate|unverified|suspicious",
- "confidence": 0.0-1.0,
- "notes": "one sentence explanation"}
-No extra text."""
-
-HINDI_SYSTEM = """Translate the following English text to Hindi (Devanagari script).
-Keep proper nouns, organisation names, and English abbreviations as-is.
-Return only the translated text, nothing else."""
+Rules:
+- key_points: exactly 3-5 items, each one crisp exam-relevant sentence
+- fact_check.status: "verified" for PIB/government sources, "likely_accurate" for reputable press
+- Hindi: keep English abbreviations (RBI, UPSC, GDP etc.) as-is, translate rest to Devanagari
+- Return ONLY the raw JSON object. No markdown, no code fences, no extra text."""
 
 
-def _safe_json(text: str, fallback):
-    """Try to parse JSON from AI response, return fallback on failure."""
-    # Strip markdown code fences if present
-    text = re.sub(r"```(?:json)?", "", text).strip().rstrip("```").strip()
+def _safe_parse(raw: str, source: str) -> dict:
+    """Parse AI JSON response safely with multiple fallback strategies."""
+    # Strip markdown fences if present
+    clean = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+
+    # Try direct parse
     try:
-        return json.loads(text)
-    except Exception:
-        # Try to extract array or object with regex
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting JSON object with regex
+    m = re.search(r"\{.*\}", clean, re.DOTALL)
+    if m:
         try:
-            m = re.search(r"(\[.*?\]|\{.*?\})", text, re.DOTALL)
-            if m:
-                return json.loads(m.group(1))
-        except Exception:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
             pass
-    return fallback
+
+    # Return safe fallback
+    return {}
 
 
-def enrich_article(article: dict) -> dict:
-    """Run the full enrichment pipeline for a single article."""
-    title = article["title"]
-    summary = article.get("summary", "")
-    source = article["source"]
-    user_text = f"Headline: {title}\nSource: {source}\nSummary: {summary}"
-
-    # ── 1. Context ────────────────────────────────────────────────────────────
-    try:
-        context = chat(CONTEXT_SYSTEM, user_text, max_tokens=300)
-    except Exception as e:
-        print(f"    Context failed: {e}")
-        context = summary[:400] if summary else title
-
-    # ── 2. Key points ─────────────────────────────────────────────────────────
-    try:
-        raw = chat(KEY_POINTS_SYSTEM, user_text, max_tokens=400)
-        key_points = _safe_json(raw, [])
-        if not isinstance(key_points, list) or len(key_points) == 0:
-            key_points = [context]
-    except Exception as e:
-        print(f"    Key points failed: {e}")
-        key_points = [context]
-
-    # ── 3. Fact check ─────────────────────────────────────────────────────────
-    try:
-        raw = chat(FACT_CHECK_SYSTEM, user_text, max_tokens=150, temperature=0.1)
-        fact_check = _safe_json(
-            raw,
-            {"status": "unverified", "confidence": 0.5, "notes": "Could not assess."},
-        )
-    except Exception as e:
-        print(f"    Fact-check failed: {e}")
-        # PIB is government source — auto-mark as verified
-        if source == "PIB":
-            fact_check = {"status": "verified", "confidence": 0.9, "notes": "Official government source."}
-        else:
-            fact_check = {"status": "likely_accurate", "confidence": 0.75, "notes": "Reputable news source."}
-
-    # ── 4. Hindi translation ───────────────────────────────────────────────────
-    try:
-        title_hi = chat(HINDI_SYSTEM, title, max_tokens=150)
-        context_hi = chat(HINDI_SYSTEM, context, max_tokens=400)
-        key_points_hi = [
-            chat(HINDI_SYSTEM, pt, max_tokens=200) for pt in key_points[:3]
-        ]
-    except Exception as e:
-        print(f"    Hindi translation failed: {e}")
-        title_hi = title
-        context_hi = context
-        key_points_hi = key_points
-
-    time.sleep(0.5)   # Respect free-tier rate limits
-
+def _build_fallback(article: dict) -> dict:
+    """Build fallback values when AI call fails entirely."""
+    title   = article.get("title", "")
+    summary = article.get("summary", "")[:300]
+    source  = article.get("source", "")
+    is_pib  = source == "PIB"
     return {
-        **article,
-        "context": context,
-        "key_points": key_points,
-        "fact_check": fact_check,
-        "title_hi": title_hi,
-        "context_hi": context_hi,
-        "key_points_hi": key_points_hi,
+        "context":       summary or title,
+        "key_points":    [title],
+        "fact_check":    {
+            "status":     "verified" if is_pib else "likely_accurate",
+            "confidence": 0.9 if is_pib else 0.75,
+            "notes":      "Official government source." if is_pib else "Reputable news source.",
+        },
+        "title_hi":      title,
+        "context_hi":    summary or title,
+        "key_points_hi": [title],
     }
 
 
+def _validate_and_merge(parsed: dict, fallback: dict) -> dict:
+    """Ensure all required fields exist and have correct types."""
+    result = {}
+
+    # context — string
+    ctx = parsed.get("context", "")
+    result["context"] = ctx if isinstance(ctx, str) and ctx.strip() else fallback["context"]
+
+    # key_points — list of strings
+    kp = parsed.get("key_points", [])
+    if isinstance(kp, list) and len(kp) >= 1:
+        result["key_points"] = [str(p) for p in kp[:5]]
+    else:
+        result["key_points"] = fallback["key_points"]
+
+    # fact_check — dict with required keys
+    fc = parsed.get("fact_check", {})
+    valid_statuses = {"verified", "likely_accurate", "unverified", "suspicious"}
+    if isinstance(fc, dict) and fc.get("status") in valid_statuses:
+        result["fact_check"] = {
+            "status":     fc["status"],
+            "confidence": float(fc.get("confidence", 0.7)),
+            "notes":      str(fc.get("notes", "")),
+        }
+    else:
+        result["fact_check"] = fallback["fact_check"]
+
+    # Hindi fields — strings / lists
+    result["title_hi"]      = str(parsed.get("title_hi", "")).strip() or fallback["title_hi"]
+    result["context_hi"]    = str(parsed.get("context_hi", "")).strip() or fallback["context_hi"]
+    kp_hi = parsed.get("key_points_hi", [])
+    result["key_points_hi"] = [str(p) for p in kp_hi[:5]] if isinstance(kp_hi, list) and kp_hi else fallback["key_points_hi"]
+
+    return result
+
+
+def enrich_article(article: dict) -> dict:
+    """Single AI call enrichment for one article."""
+    title   = article["title"]
+    summary = article.get("summary", "")[:600]
+    source  = article["source"]
+
+    user_prompt = f"Headline: {title}\nSource: {source}\nSummary: {summary}"
+    fallback    = _build_fallback(article)
+
+    try:
+        raw    = chat(BATCH_SYSTEM, user_prompt, max_tokens=900, temperature=0.3)
+        parsed = _safe_parse(raw, source)
+        fields = _validate_and_merge(parsed, fallback)
+    except Exception as exc:
+        print(f"    ⚠ AI call failed: {exc} — using fallback values")
+        fields = fallback
+
+    return {**article, **fields}
+
+
 def generate_content(articles: list[dict]) -> list[dict]:
-    """Enrich all articles. Returns enriched list."""
-    enriched = []
+    """Enrich all articles with a single AI call each. Returns enriched list."""
+    enriched: list[dict] = []
     total = len(articles)
+
+    print(f"  ℹ Using 1 AI call per article = {total} total calls (free-tier safe)")
+    print(f"  ℹ Sleeping {INTER_ARTICLE_SLEEP}s between articles to respect rate limits\n")
+
     for i, article in enumerate(articles, 1):
-        print(f"\n  🤖 Enriching [{i}/{total}]: {article['title'][:70]}...")
+        print(f"  🤖 [{i:02d}/{total}] {article['title'][:70]}…")
         try:
             enriched.append(enrich_article(article))
-        except Exception as e:
-            print(f"    ❌ Failed to enrich: {e}")
-            # Include article without enrichment rather than dropping it
-            article.setdefault("context", article.get("summary", article["title"]))
-            article.setdefault("key_points", [])
-            article.setdefault("fact_check", {"status": "unverified", "confidence": 0.5, "notes": ""})
-            article.setdefault("title_hi", article["title"])
-            article.setdefault("context_hi", article.get("context", ""))
-            article.setdefault("key_points_hi", [])
-            enriched.append(article)
+            print(f"         ✅ done")
+        except Exception as exc:
+            print(f"         ❌ Failed: {exc} — including with fallback")
+            enriched.append({**article, **_build_fallback(article)})
+
+        # Rate limit guard — skip sleep after last article
+        if i < total:
+            time.sleep(INTER_ARTICLE_SLEEP)
+
     return enriched
